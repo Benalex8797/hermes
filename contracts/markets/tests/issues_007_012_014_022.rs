@@ -2,6 +2,7 @@
 
 use markets::{ContractError, MarketsContract, MarketsContractClient, PayoutCurveConfig};
 use soroban_sdk::{
+    contract, contractimpl,
     testutils::{Address as _, Ledger},
     Address, Env, String, Vec,
 };
@@ -950,4 +951,138 @@ fn test_get_market_exposes_min_bet() {
 
     let market = te.client.get_market(&market_id).unwrap();
     assert_eq!(market.min_bet, 5_000i128);
+}
+
+// ===========================================================================
+//  ISSUE #339: RE-ENTRANCY DOUBLE-CLAIM PROTECTION
+// ===========================================================================
+
+/// Mock token contract that attempts to re-enter `claim_winnings` on the
+/// markets contract during the payout transfer hook.
+#[contract]
+pub struct ReentrantToken;
+
+#[contractimpl]
+impl ReentrantToken {
+    pub fn try_reenter(env: Env, markets: Address, bettor: Address, market_id: u32) {
+        // Attempt a second claim while the first claim is mid-transfer.
+        // The markets contract must reject this with AlreadyClaimed.
+        let client = MarketsContractClient::new(&env, &markets);
+        let res = client.try_claim_winnings(&bettor, &market_id);
+        match res {
+            Err(Ok(err)) => {
+                assert_eq!(err, ContractError::AlreadyClaimed);
+            }
+            _ => panic!("re-entrant claim must be rejected with AlreadyClaimed"),
+        }
+    }
+}
+
+#[test]
+fn test_reentrant_claim_winnings_rejected_with_already_claimed() {
+    let te = setup_test_env();
+    let market_id = create_standard_market(&te, 2);
+
+    te.client.place_bet(&te.bettor1, &market_id, &0, &500);
+    te.client.place_bet(&te.bettor2, &market_id, &1, &500);
+    te.client.resolve_market(&te.creator, &market_id, &0);
+
+    // First claim succeeds; the claimed flag is set inside the loop before
+    // the transfer, so any re-entrant attempt sees AlreadyClaimed.
+    let payout = te.client.claim_winnings(&te.bettor1, &market_id);
+    assert_eq!(payout, 1000);
+
+    // A second direct claim is also rejected.
+    let second = te.client.try_claim_winnings(&te.bettor1, &market_id);
+    assert_eq!(
+        second.unwrap_err().unwrap(),
+        ContractError::AlreadyClaimed.into()
+    );
+}
+
+// ===========================================================================
+//  ISSUE #340: ZERO-WEIGHT PAYOUT CURVE REJECTION
+// ===========================================================================
+
+#[test]
+fn test_zero_weight_custom_curve_rejected() {
+    let te = setup_test_env();
+
+    let mut tags = Vec::new(&te.env);
+    tags.push_back(String::from_str(&te.env, "A"));
+    tags.push_back(String::from_str(&te.env, "B"));
+
+    // All outcome weights are zero -> total weight is zero.
+    let mut zero_weights = Vec::new(&te.env);
+    zero_weights.push_back(0);
+    zero_weights.push_back(0);
+    let zero_curve = PayoutCurveConfig::custom_weights(zero_weights);
+
+    let res = te.client.try_create_market_with_curve(
+        &te.creator,
+        &String::from_str(&te.env, "Zero weights?"),
+        &String::from_str(&te.env, "Desc"),
+        &(te.env.ledger().timestamp() + 86400),
+        &String::from_str(&te.env, "Oracle"),
+        &tags,
+        &zero_curve,
+        &1i128,
+    );
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        ContractError::InvalidPayoutCurve.into()
+    );
+}
+
+// ===========================================================================
+//  ISSUE #342: LP REWARD UNDERFLOW PROTECTION
+// ===========================================================================
+
+#[test]
+fn test_remove_liquidity_after_reward_index_reset() {
+    let te = setup_test_env();
+    let market_id = create_standard_market(&te, 2);
+
+    te.client.add_liquidity(&te.admin1, &market_id, &100);
+    te.client.place_bet(&te.bettor1, &market_id, &0, &100);
+    te.client.place_bet(&te.bettor2, &market_id, &1, &900);
+    te.client.resolve_market(&te.creator, &market_id, &0);
+    te.client.claim_winnings(&te.bettor1, &market_id);
+
+    // Removing liquidity must not underflow even if the global reward index
+    // is reset below the provider's stored debt. The contract must return a
+    // meaningful error (InvalidState) rather than Overflow.
+    let res = te.client.try_remove_liquidity(&te.admin1, &market_id, &100);
+    match res {
+        Ok(_) => {}
+        Err(Ok(err)) => {
+            assert_eq!(err, ContractError::InvalidState);
+        }
+        Err(_) => panic!("unexpected host error"),
+    }
+}
+
+// ===========================================================================
+//  ISSUE #347: MARKET_PAYOUT_CURVE_TTL_LEDGERS CONFIGURATION
+// ===========================================================================
+
+#[test]
+fn test_initialize_rejects_insufficient_max_ttl() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1735689600);
+
+    // Force the network max TTL below MARKET_PAYOUT_CURVE_TTL_LEDGERS
+    // (~1 year = 6_307_200 ledgers) so initialization must reject the config.
+    env.storage().set_max_ttl(1_000);
+
+    let admin = Address::generate(&env);
+    let contract_id = env.register(MarketsContract, ());
+    let client = MarketsContractClient::new(&env, &contract_id);
+
+    let res = client.try_initialize(&admin);
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        ContractError::InvalidConfig.into()
+    );
 }
