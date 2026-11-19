@@ -382,6 +382,32 @@ fn test_resolve_market_requires_auth_creator() {
     assert!(result.is_ok(), "Market creator should resolve market");
 }
 
+/// Regression test for issue #200.
+///
+/// A non-creator, non-admin caller must not be able to resolve a market.
+/// The missing authorization check previously went undetected because this
+/// test case did not exist.
+#[test]
+fn test_resolve_market_rejects_non_creator() {
+    let env = Env::default();
+    let setup = setup_test_environment(&env);
+    env.mock_all_auths();
+
+    let market_id = create_market_with_auth_check(&setup);
+
+    let winning_outcome = 0;
+
+    let result =
+        setup
+            .client
+            .try_resolve_market(&setup.unauthorized, &market_id, &winning_outcome);
+    assert_eq!(
+        result,
+        Err(Ok(ContractError::Unauthorized)),
+        "Non-creator must not resolve market"
+    );
+}
+
 // ── claim_winnings ────────────────────────────────────────────────────────────
 
 #[test]
@@ -758,6 +784,53 @@ fn test_admin_requires_auth_admin() {
 
     let result = setup.client.try_unpause_markets(&setup.admin);
     assert!(result.is_ok(), "Admin should unpause markets");
+}
+
+// ── execute_pause (issue #341) ────────────────────────────────────────────────
+
+/// Regression test for issue #341.
+///
+/// `execute_pause` must require BOTH the timelock to have expired AND the
+/// approval threshold to be reached. A single admin must not be able to
+/// execute a pause proposal after the timelock expires if the threshold has
+/// not been met.
+#[test]
+fn test_execute_pause_requires_approval_threshold_after_timelock() {
+    let env = Env::default();
+    let setup = setup_test_environment(&env);
+    env.mock_all_auths();
+
+    let admin_a = setup.admin.clone();
+    let admin_b = Address::generate(&env);
+    let admin_c = Address::generate(&env);
+
+    // Configure 3 admins with an approval threshold of 2.
+    setup.client.set_admin_threshold(&admin_a, &2);
+    setup.client.add_admin(&admin_a, &admin_b);
+    setup.client.add_admin(&admin_a, &admin_c);
+
+    // Admin A proposes and approves a pause.
+    let proposal_id = setup.client.propose_pause(&admin_a);
+    setup.client.approve_pause(&admin_a, &proposal_id);
+
+    // Advance the ledger past the timelock.
+    env.ledger().set_timestamp(1735689600 + 7 * 86_400);
+
+    // Only one of two required approvals: execution must fail.
+    let result = setup.client.try_execute_pause(&admin_a, &proposal_id);
+    assert_eq!(
+        result,
+        Err(Ok(ContractError::ProposalNotExecutable)),
+        "Pause must not execute before approval threshold is reached"
+    );
+
+    // Second admin approves; now the proposal is executable.
+    setup.client.approve_pause(&admin_b, &proposal_id);
+    let result = setup.client.try_execute_pause(&admin_a, &proposal_id);
+    assert!(
+        result.is_ok(),
+        "Pause should execute once threshold is reached and timelock expired"
+    );
 }
 
 // ── transfer_ownership ────────────────────────────────────────────────────────

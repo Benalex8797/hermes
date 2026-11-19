@@ -321,6 +321,26 @@ impl MarketsContract {
         }
     }
 
+    /// Enforces the configured market cap before a new market ID is allocated.
+    ///
+    /// Shared by `create_market` and `create_market_with_curve` so both
+    /// entrypoints honour `DataKey::MarketLimit` identically.
+    fn assert_market_limit(env: &Env) {
+        let limit: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MarketLimit)
+            .unwrap_or(DEFAULT_MAX_MARKET_COUNT);
+        let counter: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MarketCounter)
+            .unwrap_or(0u32);
+        if counter >= limit {
+            panic_with_error!(env, ContractError::MarketLimitReached);
+        }
+    }
+
     fn validate_payout_curve(env: &Env, curve: &PayoutCurveConfig, num_outcomes: u32) {
         match curve.curve_type {
             PayoutCurveConfig::WINNER_TAKES_ALL => {}
@@ -856,6 +876,7 @@ impl MarketsContract {
         outcome_tags: Vec<String>,
         min_bet: i128,
     ) -> u32 {
+        Self::assert_market_limit(&env);
         Self::create_market_with_curve(
             env.clone(),
             creator,
@@ -883,6 +904,8 @@ impl MarketsContract {
     ) -> u32 {
         creator.require_auth();
 
+        Self::assert_market_limit(&env);
+
         if outcome_tags.len() < 2 {
             panic_with_error!(env, ContractError::InvalidConfig);
         }
@@ -898,9 +921,6 @@ impl MarketsContract {
             .persistent()
             .get(&DataKey::MarketCounter)
             .unwrap_or(0u32);
-        if counter >= Self::get_market_limit(env.clone()) {
-            panic_with_error!(env, ContractError::MarketLimitReached);
-        }
 
         let market_id = match counter.checked_add(1) {
             Some(id) => id,
@@ -1898,6 +1918,8 @@ impl MarketsContract {
             panic_with_error!(env, ContractError::ProposalNotExecutable);
         }
 
+        // Approval threshold must be satisfied before the timelock is considered,
+        // so a single admin cannot execute once the timelock has merely expired.
         let (_, required_approvals) = Self::get_pause_config(env.clone());
         if proposal.approvals.len() < required_approvals {
             panic_with_error!(env, ContractError::ProposalNotExecutable);
