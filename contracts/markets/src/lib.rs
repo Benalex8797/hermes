@@ -876,6 +876,7 @@ impl MarketsContract {
         outcome_tags: Vec<String>,
         min_bet: i128,
     ) -> u32 {
+        Self::assert_market_limit(&env);
         Self::create_market_with_curve(
             env.clone(),
             creator,
@@ -904,6 +905,8 @@ impl MarketsContract {
         Self::require_initialized(&env);
         creator.require_auth();
 
+        Self::assert_market_limit(&env);
+
         if outcome_tags.len() < 2 {
             panic_with_error!(env, ContractError::InvalidConfig);
         }
@@ -919,9 +922,6 @@ impl MarketsContract {
             .persistent()
             .get(&DataKey::MarketCounter)
             .unwrap_or(0u32);
-        if counter >= Self::get_market_limit(env.clone()) {
-            panic_with_error!(env, ContractError::MarketLimitReached);
-        }
 
         let market_id = match counter.checked_add(1) {
             Some(id) => id,
@@ -1994,6 +1994,8 @@ impl MarketsContract {
             panic_with_error!(env, ContractError::ProposalNotExecutable);
         }
 
+        // Approval threshold must be satisfied before the timelock is considered,
+        // so a single admin cannot execute once the timelock has merely expired.
         let (_, required_approvals) = Self::get_pause_config(env.clone());
         if proposal.approvals.len() < required_approvals {
             panic_with_error!(env, ContractError::ProposalNotExecutable);
