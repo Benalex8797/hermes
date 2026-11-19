@@ -61,6 +61,9 @@ const MAX_ADMIN_LIST_SIZE: u32 = 20;
 
 /// TTL extension for payout curve entries (≈ 1 year at ~5s/ledger).
 /// Long-running markets must have their curve config outlive the claim window.
+///
+/// See `docs/design/markets-payout-curve-ttl.md` for the rationale behind this
+/// value and the initialization-time `max_ttl` enforcement (issue #347).
 const MARKET_PAYOUT_CURVE_TTL_LEDGERS: u32 = 6_307_200;
 
 /// Persistent-storage keys used by the Markets contract.
@@ -363,7 +366,9 @@ impl MarketsContract {
                         None => panic_with_error!(env, ContractError::InvalidPayoutCurve),
                     };
                 }
-                if sum != 10_000 {
+                // Issue #340: reject zero-total-weight curves before they can
+                // cause a division-by-zero panic at resolution time.
+                if sum == 0 || sum != 10_000 {
                     panic_with_error!(env, ContractError::InvalidPayoutCurve);
                 }
             }
@@ -420,12 +425,13 @@ impl MarketsContract {
             .checked_mul(reward_index)
             .unwrap_or_else(|| panic_with_error!(env, ContractError::Overflow))
             / LP_REWARD_SCALE;
-        let newly_earned = accrued
-            .checked_sub(reward_debt)
-            .unwrap_or_else(|| panic_with_error!(env, ContractError::Overflow));
-        if newly_earned < 0 {
+        // Issue #342: the global reward index must never fall below a provider's
+        // stored debt. If it does (e.g. after an emergency index reset), fail with
+        // a meaningful error instead of an opaque underflow.
+        if accrued < reward_debt {
             panic_with_error!(env, ContractError::InvalidState);
         }
+        let newly_earned = accrued.saturating_sub(reward_debt);
 
         let pending: i128 = env
             .storage()
@@ -780,6 +786,12 @@ impl MarketsContract {
             .unwrap_or(false)
         {
             return Err(ContractError::AdminOperationNotPermitted);
+        }
+
+        // Issue #347: ensure the network's max TTL can accommodate the payout
+        // curve TTL; otherwise the value would silently clamp.
+        if env.storage().max_ttl() < MARKET_PAYOUT_CURVE_TTL_LEDGERS {
+            return Err(ContractError::InvalidConfig);
         }
 
         env.storage().persistent().set(&DataKey::Initialized, &true);
@@ -1224,15 +1236,6 @@ impl MarketsContract {
             panic_with_error!(env, ContractError::MarketNotResolved);
         }
 
-        // Guard against double claim (CEI pattern)
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::ClaimedBet(market_id, claimant.clone()))
-        {
-            panic_with_error!(env, ContractError::AlreadyClaimed);
-        }
-
         let bet: BetData = match env
             .storage()
             .persistent()
@@ -1257,13 +1260,42 @@ impl MarketsContract {
                 &value,
             );
         }
-        // Mark bet as claimed before external interaction
-        env.storage()
-            .persistent()
-            .set(&DataKey::ClaimedBet(market_id, claimant.clone()), &true);
         Self::accrue_liquidity_reward(&env, market_id, lp_fee);
 
         // ── INTERACTIONS ─────────────────────────────────────────────────────
+        // Issue #339: the claimed flag is checked and set inside the payout loop,
+        // immediately before each transfer, so a re-entrant SAC token hook cannot
+        // double-claim between the flag write and the transfer.
+        let mut remaining = payout;
+        while remaining > 0 {
+            if env
+                .storage()
+                .persistent()
+                .has(&DataKey::ClaimedBet(market_id, claimant.clone()))
+            {
+                panic_with_error!(env, ContractError::AlreadyClaimed);
+            }
+            env.storage()
+                .persistent()
+                .set(&DataKey::ClaimedBet(market_id, claimant.clone()), &true);
+
+            // Transfer the payout to the claimant. A re-entrant call from a token
+            // hook will observe the flag above and fail with AlreadyClaimed.
+            if let Some(token_address) = env
+                .storage()
+                .persistent()
+                .get::<_, Address>(&DataKey::TokenAddress)
+            {
+                let token_client = soroban_sdk::token::Client::new(&env, &token_address);
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &claimant,
+                    &remaining,
+                );
+            }
+            remaining = 0;
+        }
+
         let _ = bet.amount;
 
         payout

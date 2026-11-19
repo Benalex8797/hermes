@@ -6,6 +6,46 @@
 
 **Impact**: Incorrect payout calculation causing over-payment to one group of bettors and under-payment to others.
 
+## Zero-Total-Weight Validation (Issue #340)
+
+**Problem**: `create_market_with_curve` previously accepted configurations where all outcome weights sum to zero. Such a configuration passed validation but caused an integer division panic at resolution when payout shares were computed.
+
+**Fix**: `validate_payout_curve` now asserts `total_weight > 0` and returns `InvalidPayoutCurve` immediately at curve configuration time when the total weight is zero. This fails fast at market creation instead of panicking at resolution.
+
+```rust
+pub fn validate_payout_curve(curve: &PayoutCurve) -> Result<(), Error> {
+    // ... existing per-outcome validation ...
+
+    // CRITICAL: reject zero total weight to avoid division-by-zero at resolution
+    let total_weight: i128 = curve.weights.iter().sum();
+    if total_weight <= 0 {
+        return Err(Error::InvalidPayoutCurve);
+    }
+
+    Ok(())
+}
+```
+
+### Validation Rules Summary
+
+`validate_payout_curve` enforces the following rules at configuration time:
+
+| Rule | Error Returned |
+|------|----------------|
+| Outcome identifiers non-empty | `InvalidOutcome` |
+| Weights non-negative | `InvalidPayoutCurve` |
+| Total weight strictly greater than zero | `InvalidPayoutCurve` |
+| TIERED: `runner_up_outcome != winning_outcome` (resolution-time) | `InvalidPayoutCurve` |
+
+## Related Fixes
+
+The payout curve documentation should be read alongside these related fixes, which together harden the resolution and payout paths:
+
+- **Re-entrancy fix in `claim_winnings`**: Claim processing is guarded against re-entrant calls so that payout state cannot be mutated mid-claim. Curve validation and payout math assume a single, non-reentrant claim execution.
+- **LP reward underflow fix**: LP reward accounting now saturates/guards against underflow, ensuring that payout curve distributions and LP rewards cannot drive balances negative or wrap around.
+
+Any change to `validate_payout_curve` must keep these invariants intact: zero total weight is rejected up front, claims are non-reentrant, and LP reward math cannot underflow.
+
 ## Solution Overview
 
 This fix implements a comprehensive documentation and validation framework to prevent the TIERED payout curve double-counting issue:
@@ -97,7 +137,12 @@ pub fn validate_tiered_curve(curve: &TieredPayoutCurve) -> Result<(), Error> {
     if curve.runner_up_outcome.is_empty() {
         return Err(Error::InvalidOutcome);
     }
-    // CRITICAL CHECK
+    // CRITICAL CHECK: reject zero total weight (Issue #340)
+    let total_weight: i128 = curve.weights.iter().sum();
+    if total_weight <= 0 {
+        return Err(Error::InvalidPayoutCurve);
+    }
+    // CRITICAL CHECK: runner-up must differ from winner
     if curve.winning_outcome == curve.runner_up_outcome {
         return Err(Error::InvalidPayoutCurve);
     }
@@ -238,6 +283,9 @@ When TIERED curves are added:
 - [x] Implementation path clear
 - [x] Error handling specified
 - [x] Code location identified
+- [x] Zero total weight rejected with `InvalidPayoutCurve` (Issue #340)
+- [x] Cross-referenced re-entrancy fix in `claim_winnings`
+- [x] Cross-referenced LP reward underflow fix
 
 ## Next Steps
 
@@ -254,6 +302,8 @@ When TIERED curves are added:
 ## References
 
 - **Issue**: Runner-up outcome double-counting in TIERED curves
-- **Impact**: Incorrect payouts, over/under-payment
-- **Mitigation**: Resolution-time check with winner-takes-all fallback
+- **Issue #340**: Zero-weight payout curve causes division-by-zero panic at resolution
+- **Impact**: Incorrect payouts, over/under-payment; division-by-zero panic at resolution
+- **Mitigation**: Configuration-time `total_weight > 0` check (`InvalidPayoutCurve`), resolution-time check with winner-takes-all fallback
+- **Related**: Re-entrancy guard in `claim_winnings`, LP reward underflow fix
 - **Confidence**: 100% backward compatible, zero breaking changes
