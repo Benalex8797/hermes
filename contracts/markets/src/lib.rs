@@ -135,6 +135,10 @@ pub enum DataKey {
     WithdrawalFeeBps,
     /// Cumulative platform fees collected.
     CollectedFees,
+
+    // ── Issue #343: Deadline Grace Period ───────────────────────────
+    /// Maximum number of seconds a market deadline may be shortened.
+    DeadlineGracePeriodSeconds,
 }
 
 /// On-chain representation of a prediction market.
@@ -321,23 +325,19 @@ impl MarketsContract {
         }
     }
 
-    /// Enforces the configured market cap before a new market ID is allocated.
-    ///
-    /// Shared by `create_market` and `create_market_with_curve` so both
-    /// entrypoints honour `DataKey::MarketLimit` identically.
-    fn assert_market_limit(env: &Env) {
-        let limit: u32 = env
-            .storage()
+    /// Returns `true` once `initialize` has stored both the init flag and admin.
+    fn is_initialized(env: &Env) -> bool {
+        env.storage()
             .persistent()
-            .get(&DataKey::MarketLimit)
-            .unwrap_or(DEFAULT_MAX_MARKET_COUNT);
-        let counter: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::MarketCounter)
-            .unwrap_or(0u32);
-        if counter >= limit {
-            panic_with_error!(env, ContractError::MarketLimitReached);
+            .get::<_, bool>(&DataKey::Initialized)
+            .unwrap_or(false)
+            && env.storage().persistent().has(&DataKey::Admin)
+    }
+
+    /// Guards state-changing entrypoints against use before `initialize`.
+    fn require_initialized(env: &Env) {
+        if !Self::is_initialized(env) {
+            panic_with_error!(env, ContractError::InvalidState);
         }
     }
 
@@ -902,6 +902,7 @@ impl MarketsContract {
         curve: PayoutCurveConfig,
         min_bet: i128,
     ) -> u32 {
+        Self::require_initialized(&env);
         creator.require_auth();
 
         Self::assert_market_limit(&env);
@@ -966,6 +967,7 @@ impl MarketsContract {
         market_id: u32,
         curve: PayoutCurveConfig,
     ) {
+        Self::require_initialized(&env);
         caller.require_auth();
 
         let market: MarketData = match env.storage().persistent().get(&DataKey::Market(market_id)) {
@@ -1019,6 +1021,7 @@ impl MarketsContract {
     /// Places a bet on a specific market outcome, updating bet enumeration (#022)
     /// and pool balances (#014).
     pub fn place_bet(env: Env, user: Address, market_id: u32, outcome_index: u32, amount: i128) {
+        Self::require_initialized(&env);
         user.require_auth();
 
         if Self::is_paused(env.clone()) {
@@ -1098,6 +1101,7 @@ impl MarketsContract {
     ///
     /// Only the market creator or a platform admin may resolve a market.
     pub fn resolve_market(env: Env, resolver: Address, market_id: u32, winning_outcome: u32) {
+        Self::require_initialized(&env);
         resolver.require_auth();
 
         let mut market: MarketData =
@@ -1144,6 +1148,7 @@ impl MarketsContract {
         market_id: u32,
         winning_outcomes: Vec<u32>,
     ) {
+        Self::require_initialized(&env);
         resolver.require_auth();
 
         let mut market: MarketData =
@@ -1206,6 +1211,7 @@ impl MarketsContract {
     /// Claims winnings for a resolved market upholding CEI pattern and applying
     /// the configured payout curve (#014, #021).
     pub fn claim_winnings(env: Env, claimant: Address, market_id: u32) -> i128 {
+        Self::require_initialized(&env);
         claimant.require_auth();
 
         // ── CHECKS ───────────────────────────────────────────────────────────
@@ -1267,6 +1273,7 @@ impl MarketsContract {
     ///
     /// Only the market creator or a platform admin may cancel a market.
     pub fn cancel_market(env: Env, caller: Address, market_id: u32) {
+        Self::require_initialized(&env);
         caller.require_auth();
 
         let mut market: MarketData =
@@ -1295,6 +1302,7 @@ impl MarketsContract {
 
     /// Withdraws funds from a market.
     pub fn withdraw_funds(env: Env, caller: Address, market_id: u32, amount: i128) {
+        Self::require_initialized(&env);
         caller.require_auth();
 
         if !env.storage().persistent().has(&DataKey::Market(market_id)) {
@@ -1305,19 +1313,72 @@ impl MarketsContract {
     }
 
     /// Updates the parameters of an existing market.
+    ///
+    /// The new deadline must be strictly in the future and may not be shortened
+    /// by more than the configured grace period relative to the original deadline.
     pub fn update_market_params(env: Env, caller: Address, market_id: u32, new_end_time: u64) {
+        Self::require_initialized(&env);
         caller.require_auth();
 
-        let market: MarketData = match env.storage().persistent().get(&DataKey::Market(market_id)) {
-            Some(m) => m,
-            None => panic_with_error!(env, ContractError::MarketNotFound),
-        };
+        let mut market: MarketData =
+            match env.storage().persistent().get(&DataKey::Market(market_id)) {
+                Some(m) => m,
+                None => panic_with_error!(env, ContractError::MarketNotFound),
+            };
 
         if market.resolved {
             panic_with_error!(env, ContractError::MarketAlreadyResolved);
         }
+        if market.cancelled {
+            panic_with_error!(env, ContractError::InvalidState);
+        }
+        if caller != market.creator && !Self::is_admin_internal(&env, &caller) {
+            panic_with_error!(env, ContractError::Unauthorized);
+        }
 
-        let _ = new_end_time;
+        let now = env.ledger().timestamp();
+        if new_end_time <= now {
+            panic_with_error!(env, ContractError::InvalidConfig);
+        }
+
+        let grace_period: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DeadlineGracePeriodSeconds)
+            .unwrap_or(0);
+        let earliest_allowed = market.end_time.saturating_sub(grace_period);
+        if new_end_time < earliest_allowed {
+            panic_with_error!(env, ContractError::InvalidConfig);
+        }
+
+        let previous_end_time = market.end_time;
+        market.end_time = new_end_time;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Market(market_id), &market);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("MarketUpd"), market_id),
+            (previous_end_time, new_end_time),
+        );
+    }
+
+    /// Configures the grace period (in seconds) by which a market deadline may be
+    /// shortened via `update_market_params`.
+    pub fn set_deadline_grace_period(env: Env, admin: Address, grace_period_seconds: u64) {
+        Self::require_initialized(&env);
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::DeadlineGracePeriodSeconds, &grace_period_seconds);
+    }
+
+    /// Returns the configured deadline grace period in seconds.
+    pub fn get_deadline_grace_period(env: Env) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DeadlineGracePeriodSeconds)
+            .unwrap_or(0)
     }
 
     // -----------------------------------------------------------------------
@@ -1326,6 +1387,7 @@ impl MarketsContract {
 
     /// Adds liquidity to a market.
     pub fn add_liquidity(env: Env, provider: Address, market_id: u32, amount: i128) {
+        Self::require_initialized(&env);
         provider.require_auth();
 
         if amount <= 0 {
@@ -1376,6 +1438,7 @@ impl MarketsContract {
 
     /// Removes liquidity from a market.
     pub fn remove_liquidity(env: Env, provider: Address, market_id: u32, amount: i128) {
+        Self::require_initialized(&env);
         provider.require_auth();
 
         if amount <= 0 {
@@ -1430,6 +1493,7 @@ impl MarketsContract {
     /// providers. The reserve is distributed pro rata by liquidity supplied when
     /// each winning claim is made; this call returns the provider's accrued amount.
     pub fn collect_fees(env: Env, provider: Address, market_id: u32) -> i128 {
+        Self::require_initialized(&env);
         provider.require_auth();
         if !env
             .storage()
@@ -1538,6 +1602,7 @@ impl MarketsContract {
 
     /// Configures the withdrawal fee parameters (#012).
     pub fn set_fee_config(env: Env, admin: Address, min_fee_amount: i128, fee_bps: i128) {
+        Self::require_initialized(&env);
         Self::require_admin(&env, &admin);
 
         if min_fee_amount < 0 || !(0..=10_000).contains(&fee_bps) {
@@ -1577,6 +1642,7 @@ impl MarketsContract {
 
     /// Configures the token contract used for user balance deposits.
     pub fn set_token_address(env: Env, admin: Address, token_address: Address) {
+        Self::require_initialized(&env);
         Self::require_admin(&env, &admin);
         env.storage()
             .persistent()
@@ -1593,6 +1659,7 @@ impl MarketsContract {
 
     /// Deposits funds into a user's internal withdrawable balance (#012).
     pub fn deposit_user_balance(env: Env, user: Address, amount: i128) {
+        Self::require_initialized(&env);
         user.require_auth();
 
         if amount <= 0 {
@@ -1625,6 +1692,7 @@ impl MarketsContract {
     /// as dust. To prevent funds from being permanently locked, the minimum fee
     /// is waived when withdrawing remaining dust.
     pub fn withdraw_user_balance(env: Env, user: Address, amount: i128) -> WithdrawalResult {
+        Self::require_initialized(&env);
         user.require_auth();
 
         if amount <= 0 {
@@ -1690,6 +1758,7 @@ impl MarketsContract {
     /// If a user balance is `<= min_fee_amount`, fees are not collected and 0 is returned,
     /// ensuring dust is never locked and `InsufficientBalance` is never thrown.
     pub fn collect_user_fees(env: Env, admin: Address, user: Address) -> i128 {
+        Self::require_initialized(&env);
         Self::require_admin(&env, &admin);
 
         let balance = Self::get_user_balance(env.clone(), user.clone());
@@ -1730,6 +1799,7 @@ impl MarketsContract {
 
     /// Set the maximum number of markets that may be created.
     pub fn set_market_limit(env: Env, admin: Address, max_market_count: u32) {
+        Self::require_initialized(&env);
         Self::require_admin(&env, &admin);
         if max_market_count == 0 {
             panic_with_error!(env, ContractError::InvalidConfig);
@@ -1741,6 +1811,7 @@ impl MarketsContract {
 
     /// Configures the pause protection parameters (delay and required approvals) (#007).
     pub fn set_pause_config(env: Env, admin: Address, delay_seconds: u64, required_approvals: u32) {
+        Self::require_initialized(&env);
         Self::require_admin(&env, &admin);
 
         if required_approvals == 0 {
@@ -1776,6 +1847,7 @@ impl MarketsContract {
         admin: Address,
         new_admin: Address,
     ) -> Result<(), ContractError> {
+        Self::require_initialized(&env);
         Self::require_admin(&env, &admin);
         if admin == new_admin {
             return Err(ContractError::AdminAddressInvalid);
@@ -1788,7 +1860,7 @@ impl MarketsContract {
             .unwrap_or(Vec::new(&env));
 
         if list.contains(&new_admin) {
-            return Ok(());
+            return Err(ContractError::AdminAddressInvalid);
         }
         if list.len() >= MAX_ADMIN_LIST_SIZE {
             return Err(ContractError::InvalidConfig);
@@ -1803,6 +1875,7 @@ impl MarketsContract {
         admin: Address,
         remove_address: Address,
     ) -> Result<(), ContractError> {
+        Self::require_initialized(&env);
         Self::require_admin(&env, &admin);
         if admin == remove_address {
             return Err(ContractError::AdminAddressInvalid);
@@ -1831,6 +1904,7 @@ impl MarketsContract {
 
     /// Proposes a global market pause with a stated justification (#007).
     pub fn propose_pause(env: Env, admin: Address, reason: String) -> u32 {
+        Self::require_initialized(&env);
         Self::require_admin(&env, &admin);
 
         let counter: u32 = env
@@ -1877,6 +1951,7 @@ impl MarketsContract {
 
     /// Approves a pending pause proposal (#007).
     pub fn approve_pause(env: Env, admin: Address, proposal_id: u32) {
+        Self::require_initialized(&env);
         Self::require_admin(&env, &admin);
 
         let mut proposal: PauseProposal = match env
@@ -1903,6 +1978,7 @@ impl MarketsContract {
 
     /// Executes an approved and timelocked pause proposal (#007).
     pub fn execute_pause(env: Env, caller: Address, proposal_id: u32) {
+        Self::require_initialized(&env);
         Self::require_admin(&env, &caller);
 
         let mut proposal: PauseProposal = match env
@@ -1940,6 +2016,7 @@ impl MarketsContract {
 
     /// Cancels a pending pause proposal (#007).
     pub fn cancel_pause(env: Env, admin: Address, proposal_id: u32) {
+        Self::require_initialized(&env);
         Self::require_admin(&env, &admin);
 
         let mut proposal: PauseProposal = match env
@@ -1975,6 +2052,7 @@ impl MarketsContract {
     /// If hardened pause protection is active (required_approvals > 1 or delay > 0),
     /// unilateral instantaneous execution is blocked with `AdminOperationNotPermitted` (#007).
     pub fn pause_markets(env: Env, admin: Address) {
+        Self::require_initialized(&env);
         Self::require_admin(&env, &admin);
 
         let (delay, required_approvals) = Self::get_pause_config(env.clone());
@@ -1987,6 +2065,7 @@ impl MarketsContract {
 
     /// Resumes all market operations globally.
     pub fn unpause_markets(env: Env, admin: Address) {
+        Self::require_initialized(&env);
         Self::require_admin(&env, &admin);
         env.storage().persistent().set(&DataKey::Paused, &false);
     }
@@ -1997,6 +2076,7 @@ impl MarketsContract {
         admin: Address,
         new_owner: Address,
     ) -> Result<(), ContractError> {
+        Self::require_initialized(&env);
         Self::require_admin(&env, &admin);
         if admin == new_owner {
             return Err(ContractError::AdminAddressInvalid);
