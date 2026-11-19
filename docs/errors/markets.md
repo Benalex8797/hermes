@@ -16,6 +16,8 @@ This document describes the `ContractError` variants for the markets smart contr
 | `8` | `Overflow` | Overflow; thrown when math operations overflow, preventing unsafe state changes. |
 | `9` | `StakeTooSmall` | Stake too small; thrown when a deposit or bet is below the minimum threshold. |
 | `10` | `InvalidState` | Invalid State; thrown when a generic state transition fails. |
+| `11` | `NotInitialized` | Not initialized; thrown when a state-changing entrypoint is called before `initialize` has been invoked. |
+| `12` | `AdminAlreadyExists` | Admin already exists; thrown when `add_admin` is called with an address that is already in the admin list. |
 
 ---
 

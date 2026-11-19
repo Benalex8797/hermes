@@ -50,6 +50,11 @@ pub enum ContractError {
     InsufficientBalance = 20,
     /// The configured maximum number of markets has been reached.
     MarketLimitReached = 21,
+    /// Contract has not been initialized; thrown when a state-changing entrypoint
+    /// is invoked before `initialize` has been called.
+    NotInitialized = 22,
+    /// The provided admin address is already present in the admin list.
+    AdminAlreadyExists = 23,
 }
 
 #[cfg(test)]
@@ -79,5 +84,7 @@ mod tests {
         assert_eq!(ContractError::InvalidPayoutCurve as u32, 19);
         assert_eq!(ContractError::InsufficientBalance as u32, 20);
         assert_eq!(ContractError::MarketLimitReached as u32, 21);
+        assert_eq!(ContractError::NotInitialized as u32, 22);
+        assert_eq!(ContractError::AdminAlreadyExists as u32, 23);
     }
 }
